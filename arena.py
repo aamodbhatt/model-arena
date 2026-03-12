@@ -56,6 +56,60 @@ DEFAULT_FREE_REASONER_FALLBACK_CANDIDATES = [
     "openrouter/healer-alpha",
     "meta-llama/llama-3.3-70b-instruct:free",
 ]
+DEFAULT_RUNTIME_FAILOVER_CANDIDATES = {
+    "strategist": [
+        "openrouter/hunter-alpha",
+        "google/gemini-2.0-flash-001",
+        "meta-llama/llama-3.3-70b-instruct:free",
+    ],
+    "reasoner": [
+        "deepseek/deepseek-chat-v3-0324",
+        "google/gemini-2.0-flash-001",
+        "openrouter/healer-alpha",
+        "openrouter/hunter-alpha",
+    ],
+    "critic": [
+        "openrouter/healer-alpha",
+        "openrouter/hunter-alpha",
+        "google/gemini-2.0-flash-001",
+    ],
+    "analyst": [
+        "google/gemini-3.1-flash-lite-preview",
+        "openrouter/hunter-alpha",
+        "google/gemini-2.0-flash-001",
+    ],
+    "vision": [
+        "qwen/qwen3-vl-8b-instruct",
+        "nvidia/nemotron-nano-12b-v2-vl:free",
+    ],
+}
+DEFAULT_RUNTIME_FREE_FAILOVER_CANDIDATES = {
+    "strategist": [
+        "openrouter/hunter-alpha",
+        "openrouter/healer-alpha",
+        "meta-llama/llama-3.3-70b-instruct:free",
+    ],
+    "reasoner": [
+        "nvidia/nemotron-3-nano-30b-a3b:free",
+        "openrouter/hunter-alpha",
+        "openrouter/healer-alpha",
+        "meta-llama/llama-3.3-70b-instruct:free",
+    ],
+    "critic": [
+        "openrouter/healer-alpha",
+        "openrouter/hunter-alpha",
+        "meta-llama/llama-3.3-70b-instruct:free",
+    ],
+    "analyst": [
+        "openrouter/hunter-alpha",
+        "openrouter/healer-alpha",
+        "meta-llama/llama-3.3-70b-instruct:free",
+    ],
+    "vision": [
+        "nvidia/nemotron-nano-12b-v2-vl:free",
+        "meta-llama/llama-3.2-11b-vision-instruct:free",
+    ],
+}
 ALWAYS_FREE_MODEL_IDS = {
     "openrouter/hunter-alpha",
     "openrouter/healer-alpha",
@@ -129,6 +183,7 @@ class ArenaRuntime:
     models: Dict[str, str]
     mode: str
     question: str
+    failover_candidates: Dict[str, List[str]] = field(default_factory=dict)
     history: List[dict] = field(default_factory=list)
     flow: List[dict] = field(default_factory=list)
     flow_status: List[str] = field(default_factory=list)
@@ -162,6 +217,7 @@ class ArenaRuntime:
         styled_prompt = f"{prompt.strip()}\n\n{ROUND_NOTE}\n{OUTPUT_STYLE_GUARD}"
         usage: Dict[str, int] = {}
         started = time.perf_counter()
+        transient_note = ""
 
         if self.flow_status and 0 <= step_index < len(self.flow_status):
             self.flow_status[step_index] = "thinking"
@@ -221,12 +277,81 @@ class ArenaRuntime:
                     {"role": "user", "content": styled_prompt},
                 ]
 
-            content, usage = self.client.chat_with_usage(
-                model=model,
-                messages=messages,
-                temperature=TEMPERATURE_BY_AGENT.get(agent_key, 0.3),
-                max_tokens=MAX_TOKENS_BY_AGENT.get(agent_key, 500),
-            )
+            def call_with_retry(
+                model_to_use: str,
+                messages_to_send: List[dict],
+                max_attempts: int = 4,
+            ) -> tuple[str, Dict[str, int]]:
+                last_exc: Optional[Exception] = None
+                for attempt in range(max_attempts):
+                    try:
+                        return self.client.chat_with_usage(
+                            model=model_to_use,
+                            messages=messages_to_send,
+                            temperature=TEMPERATURE_BY_AGENT.get(agent_key, 0.3),
+                            max_tokens=MAX_TOKENS_BY_AGENT.get(agent_key, 500),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        last_exc = exc
+                        if not self._is_transient_openrouter_error(str(exc)) or attempt == max_attempts - 1:
+                            raise
+                        # Exponential-ish backoff for provider spikes.
+                        backoff_seconds = min(3.0, 0.6 * (2**attempt))
+                        time.sleep(backoff_seconds)
+                if last_exc:
+                    raise last_exc
+                raise RuntimeError("Unknown retry failure")
+
+            def call_with_runtime_failover(messages_to_send: List[dict]) -> tuple[str, Dict[str, int]]:
+                nonlocal model, agent
+                try:
+                    return call_with_retry(model_to_use=model, messages_to_send=messages_to_send, max_attempts=4)
+                except Exception as exc:  # noqa: BLE001
+                    if not self._is_transient_openrouter_error(str(exc)):
+                        raise
+
+                    primary_error = str(exc)
+                    candidate_errors: List[str] = []
+                    for candidate in self._runtime_failover_candidates(agent_key=agent_key, current_model=model):
+                        try:
+                            response = call_with_retry(
+                                model_to_use=candidate,
+                                messages_to_send=messages_to_send,
+                                max_attempts=3,
+                            )
+                            previous_model = model
+                            model = candidate
+                            self.models[agent_key] = candidate
+                            agent = resolve_agent_view(agent_key, model)
+                            failover_note = (
+                                f"Runtime failover activated for {agent_key}: {previous_model} -> {model}"
+                            )
+                            self.session_notes.append(failover_note)
+                            if showcase:
+                                showcase.note_failover(
+                                    agent_name=agent.name,
+                                    role=agent.role,
+                                    personality=agent.personality,
+                                    color=agent.color,
+                                    old_model=previous_model,
+                                    new_model=model,
+                                )
+                            else:
+                                print_warning(failover_note)
+                            return response
+                        except Exception as candidate_exc:  # noqa: BLE001
+                            candidate_errors.append(
+                                f"{candidate}: {self._compact_error_message(str(candidate_exc), limit=140)}"
+                            )
+
+                    if candidate_errors:
+                        exhausted = "; ".join(candidate_errors[-2:])
+                        raise RuntimeError(
+                            f"{primary_error} | failover exhausted ({exhausted})"
+                        ) from exc
+                    raise
+
+            content, usage = call_with_runtime_failover(messages)
             content = self._polish_output(content)
             for retry_hint in (
                 "Your previous output was invalid (empty or placeholder). Return a complete response that follows the template exactly.",
@@ -236,12 +361,7 @@ class ArenaRuntime:
                     break
                 retry_messages = list(messages)
                 retry_messages.append({"role": "user", "content": retry_hint})
-                retry_content, retry_usage = self.client.chat_with_usage(
-                    model=model,
-                    messages=retry_messages,
-                    temperature=TEMPERATURE_BY_AGENT.get(agent_key, 0.3),
-                    max_tokens=MAX_TOKENS_BY_AGENT.get(agent_key, 500),
-                )
+                retry_content, retry_usage = call_with_runtime_failover(retry_messages)
                 content = self._polish_output(retry_content)
                 usage = self._merge_usage(usage, retry_usage)
 
@@ -249,13 +369,30 @@ class ArenaRuntime:
                 content = self._fallback_placeholder_content(agent_key=agent_key, phase=phase)
             is_error = False
         except Exception as exc:  # noqa: BLE001
-            content = f"[ERROR] {exc}"
-            is_error = True
+            error_message = str(exc)
+            if self._is_transient_openrouter_error(error_message):
+                transient_note = (
+                    f"Transient provider issue for {agent.name} ({model}) after retries: "
+                    f"{self._compact_error_message(error_message)}"
+                )
+                content = self._fallback_transient_content(
+                    agent_key=agent_key,
+                    phase=phase,
+                    error_message=error_message,
+                )
+                is_error = False
+            else:
+                content = f"[ERROR] {self._compact_error_message(error_message)}"
+                is_error = True
 
         latency = time.perf_counter() - started
 
         if self.flow_status and 0 <= step_index < len(self.flow_status):
             self.flow_status[step_index] = "error" if is_error else "done"
+        if transient_note:
+            self.session_notes.append(transient_note)
+            if not showcase:
+                print_warning(transient_note)
 
         if showcase:
             showcase.stream_content(content, delay=0.01 if not is_error else 0.0)
@@ -323,6 +460,76 @@ class ArenaRuntime:
     def _is_placeholder_output(content: str) -> bool:
         normalized = (content or "").strip().lower().strip(".")
         return normalized in {"", "none", "null", "n/a", "na", "(no content)"}
+
+    @staticmethod
+    def _is_transient_openrouter_error(message: str) -> bool:
+        lowered = (message or "").lower()
+        if "free-models-per-day" in lowered:
+            return False
+        transient_markers = [
+            "openrouter error 502",
+            "openrouter error 503",
+            "openrouter error 504",
+            "openrouter error 408",
+            "provider returned error",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "connection reset",
+            "connection aborted",
+        ]
+        if "openrouter error 429" in lowered and "rate limit exceeded" in lowered:
+            return True
+        return any(marker in lowered for marker in transient_markers)
+
+    def _runtime_failover_candidates(self, agent_key: str, current_model: str) -> List[str]:
+        configured = list(self.failover_candidates.get(agent_key, []))
+        default_pool = (
+            DEFAULT_RUNTIME_FREE_FAILOVER_CANDIDATES
+            if self.free_mode
+            else DEFAULT_RUNTIME_FAILOVER_CANDIDATES
+        )
+        configured.extend(default_pool.get(agent_key, []))
+
+        deduped: List[str] = []
+        seen = {current_model}
+        for model_id in configured:
+            candidate = str(model_id).strip()
+            if not candidate or candidate in seen:
+                continue
+            if self.free_mode and not is_free_model_id(candidate):
+                continue
+            seen.add(candidate)
+            deduped.append(candidate)
+        return deduped
+
+    @staticmethod
+    def _compact_error_message(message: str, limit: int = 260) -> str:
+        text = (message or "").replace("\n", " ").strip()
+        text = re.sub(r"\s{2,}", " ", text)
+
+        code_match = re.search(r"openrouter error\s+(\d+)", text, flags=re.IGNORECASE)
+        msg_match = re.search(r'"message"\s*:\s*"([^"]+)"', text)
+        provider_match = re.search(r'"provider_name"\s*:\s*"([^"]+)"', text)
+        if code_match and msg_match:
+            compact = f"OpenRouter error {code_match.group(1)}: {msg_match.group(1)}"
+            if provider_match:
+                compact += f" (provider: {provider_match.group(1)})"
+            return compact
+
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3].rstrip() + "..."
+
+    def _fallback_transient_content(self, agent_key: str, phase: str, error_message: str) -> str:
+        base = self._fallback_placeholder_content(agent_key=agent_key, phase=phase)
+        return (
+            "Resilience Mode:\n"
+            "• Temporary provider outage detected after retries.\n"
+            f"• Details: {self._compact_error_message(error_message, limit=180)}\n"
+            "• Continuing with fallback output to keep the arena moving.\n\n"
+            f"{base}"
+        )
 
     @staticmethod
     def _merge_usage(base: Dict[str, int], extra: Dict[str, int]) -> Dict[str, int]:
@@ -773,6 +980,33 @@ def resolve_reasoner_model(
 
     notes.append("All reasoner candidates failed probing. Keeping configured reasoner model.")
     return configured_model, notes
+
+
+def build_runtime_failover_map(reasoner_fallbacks: List[str], free_mode: bool) -> Dict[str, List[str]]:
+    base = (
+        DEFAULT_RUNTIME_FREE_FAILOVER_CANDIDATES
+        if free_mode
+        else DEFAULT_RUNTIME_FAILOVER_CANDIDATES
+    )
+    mapping: Dict[str, List[str]] = {key: list(base.get(key, [])) for key in REQUIRED_MODEL_KEYS}
+
+    if reasoner_fallbacks:
+        mapping["reasoner"] = list(reasoner_fallbacks) + mapping.get("reasoner", [])
+
+    deduped_mapping: Dict[str, List[str]] = {}
+    for key, values in mapping.items():
+        deduped: List[str] = []
+        seen = set()
+        for model in values:
+            model_id = str(model).strip()
+            if not model_id or model_id in seen:
+                continue
+            if free_mode and not is_free_model_id(model_id):
+                continue
+            seen.add(model_id)
+            deduped.append(model_id)
+        deduped_mapping[key] = deduped
+    return deduped_mapping
 
 
 def _next_log_path(logs_dir: Path) -> Path:
@@ -1363,9 +1597,14 @@ def main() -> int:
         else:
             print_info(note)
 
+    runtime_failover_candidates = build_runtime_failover_map(
+        reasoner_fallbacks=reasoner_fallbacks,
+        free_mode=args.free,
+    )
     runtime = ArenaRuntime(
         client=client,
         models=models,
+        failover_candidates=runtime_failover_candidates,
         mode=args.mode,
         question=question,
         free_mode=args.free,

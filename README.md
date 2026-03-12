@@ -7,7 +7,7 @@ It lets you watch specialized agents debate in real time, score the reasoning qu
 
 - Structured agent workflow instead of one-shot replies
 - Camera-friendly terminal UI built with Rich
-- Dynamic model fallback when selected models are unavailable
+- Dynamic model fallback at startup and mid-run (auto failover on transient provider errors)
 - Cost-aware operation with a dedicated `--free` mode
 - Research-oriented post-run synthesis with `--research`
 
@@ -19,7 +19,7 @@ It lets you watch specialized agents debate in real time, score the reasoning qu
 - `Gemini Flash Lite` (or fallback analyst model) -> Analyst/Judge (`yellow`)
 - `Qwen3.5-VL` -> Vision Interpreter (`magenta`)
 
-ModelArena automatically updates displayed identity when a role switches models (for example, Nemotron -> DeepSeek fallback).
+ModelArena automatically updates displayed identity when a role switches models (for example, Nemotron -> DeepSeek fallback), including runtime failovers during an active step.
 
 ## Debate Protocol
 

@@ -138,6 +138,23 @@ class ShowcaseSession:
         self._add_event(f"Final verdict produced by {agent_name}")
         self._refresh()
 
+    def note_failover(
+        self,
+        agent_name: str,
+        role: str,
+        personality: str,
+        color: str,
+        old_model: str,
+        new_model: str,
+    ) -> None:
+        self.active_agent = agent_name
+        self.active_role = role
+        self.active_personality = personality
+        self.active_color = color or "white"
+        self.active_model = new_model
+        self._add_event(f"Failover: {old_model} -> {new_model}")
+        self._refresh()
+
     def _add_event(self, event: str) -> None:
         self.recent_events.append(event)
         self.recent_events = self.recent_events[-6:]
