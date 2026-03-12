@@ -1,0 +1,25 @@
+models:
+  strategist: openrouter/hunter-alpha
+  reasoner: nvidia/nemotron-3-super-120b-a12b:free
+  critic: openrouter/healer-alpha
+  analyst: google/gemini-3.1-flash-lite-preview
+  vision: qwen/qwen3-vl-8b-instruct
+
+fallbacks:
+  reasoner:
+    - deepseek/deepseek-chat-v3-0324
+    - google/gemini-2.0-flash-001
+
+free_models:
+  strategist: openrouter/hunter-alpha
+  reasoner: nvidia/nemotron-3-super-120b-a12b:free
+  critic: openrouter/healer-alpha
+  analyst: openrouter/hunter-alpha
+  vision: nvidia/nemotron-nano-12b-v2-vl:free
+
+free_fallbacks:
+  reasoner:
+    - nvidia/nemotron-3-nano-30b-a3b:free
+    - openrouter/hunter-alpha
+    - openrouter/healer-alpha
+    - meta-llama/llama-3.3-70b-instruct:free
